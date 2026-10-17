@@ -155,6 +155,15 @@ jobs:
           path: target/${{ matrix.target }}/release/bundle/dmg/*.dmg
           if-no-files-found: error
 
+      - name: Publish macOS ARM64 Release
+        if: matrix.id == 'macos-aarch64' && ((github.event_name == 'push' && matrix.id == 'macos-aarch64') || (github.event_name == 'workflow_dispatch' && github.event.inputs[matrix.input] == 'true'))
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.TAG_NAME }}
+          prerelease: true
+          token: ${{ secrets.GITHUB_TOKEN }}
+          files: target/${{ matrix.target }}/release/bundle/dmg/*.dmg
+
       - name: Upload Artifacts (Windows)
         if: matrix.os == 'windows-latest' && ((github.event_name == 'push' && matrix.id == 'macos-aarch64') || (github.event_name == 'workflow_dispatch' && github.event.inputs[matrix.input] == 'true'))
         uses: actions/upload-artifact@v7
