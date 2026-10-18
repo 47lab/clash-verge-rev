@@ -67,6 +67,43 @@ const resolveRemoteVersion = (update: Update): string | null => {
   return null
 }
 
+const parseForkVersion = (input: string | null | undefined) => {
+  const version = ensureSemver(input)
+  const match = version?.match(
+    /^(\d+\.\d+\.\d+)-47lab\.([1-9]\d*)\.([1-9]\d*)$/,
+  )
+  if (!match) return null
+
+  return {
+    base: match[1],
+    run: Number(match[2]),
+    attempt: Number(match[3]),
+  }
+}
+
+export const isForkUpdateAvailable = (
+  current: string | null | undefined,
+  remote: string | null | undefined,
+): boolean => {
+  const candidate = parseForkVersion(remote)
+  if (!candidate) return false
+
+  const installed = parseForkVersion(current)
+  if (installed) {
+    const baseComparison = compareVersions(candidate.base, installed.base)
+    if (baseComparison === null) return false
+    if (baseComparison !== 0) return baseComparison > 0
+    return (
+      candidate.run > installed.run ||
+      (candidate.run === installed.run && candidate.attempt > installed.attempt)
+    )
+  }
+
+  const currentBase = ensureSemver(current)?.split(/[-+]/, 1)[0] ?? null
+  const baseComparison = compareVersions(candidate.base, currentBase)
+  return baseComparison !== null && baseComparison >= 0
+}
+
 const localVersionNormalized = normalizeVersion(appVersion)
 
 export const checkUpdateSafe = async (
@@ -76,13 +113,7 @@ export const checkUpdateSafe = async (
   if (!result) return null
 
   const remoteVersion = resolveRemoteVersion(result)
-  const comparison = compareVersions(remoteVersion, localVersionNormalized)
-
-  const isBuildToStable =
-    /^\d+\.\d+\.\d+\+[0-9A-Za-z.-]+$/.test(localVersionNormalized ?? '') &&
-    remoteVersion === localVersionNormalized?.split('+')[0]
-
-  if (comparison !== null && comparison <= 0 && !isBuildToStable) {
+  if (!isForkUpdateAvailable(localVersionNormalized, remoteVersion)) {
     try {
       await result.close()
     } catch (err) {

@@ -167,40 +167,50 @@ fn verify_signature(app_handle: &tauri::AppHandle, bytes: &[u8], signature: &str
     Ok(())
 }
 
-pub fn is_build_to_stable(current: &str, remote: &str) -> bool {
-    let Some((base, build)) = current.trim_start_matches('v').split_once('+') else {
-        return false;
-    };
-    !build.is_empty() && !base.contains('-') && base == remote.trim_start_matches('v')
+type VersionCore = (u64, u64, u64);
+
+fn parse_version_number(value: &str) -> Option<u64> {
+    if value.is_empty() || (value.len() > 1 && value.starts_with('0')) {
+        return None;
+    }
+    value.parse().ok()
 }
 
-/// Compares numeric version components after stripping version suffixes.
-fn version_lte(a: &str, b: &str) -> bool {
-    let parse = |v: &str| -> Vec<u64> {
-        v.trim_start_matches('v')
-            .split(['-', '+'])
-            .next()
-            .unwrap_or("0")
-            .split('.')
-            .filter_map(|part| part.parse::<u64>().ok())
-            .collect()
+fn parse_version_core(version: &str) -> Option<VersionCore> {
+    let core = version.trim_start_matches('v').split(['-', '+']).next()?;
+    let mut parts = core.split('.');
+    let major = parse_version_number(parts.next()?)?;
+    let minor = parse_version_number(parts.next()?)?;
+    let patch = parse_version_number(parts.next()?)?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some((major, minor, patch))
+}
+
+fn parse_fork_version(version: &str) -> Option<(VersionCore, u64, u64)> {
+    let (base, revision) = version.trim_start_matches('v').split_once("-47lab.")?;
+    let base = parse_version_core(base)?;
+    let mut parts = revision.split('.');
+    let run = parse_version_number(parts.next()?)?;
+    let attempt = parse_version_number(parts.next()?)?;
+    if run == 0 || attempt == 0 || parts.next().is_some() {
+        return None;
+    }
+    Some((base, run, attempt))
+}
+
+pub fn is_fork_update_available(current: &str, remote: &str) -> bool {
+    let Some((remote_base, remote_run, remote_attempt)) = parse_fork_version(remote) else {
+        return false;
     };
 
-    let a_parts = parse(a);
-    let b_parts = parse(b);
-    let len = a_parts.len().max(b_parts.len());
-
-    for i in 0..len {
-        let av = a_parts.get(i).copied().unwrap_or(0);
-        let bv = b_parts.get(i).copied().unwrap_or(0);
-        if av < bv {
-            return true;
-        }
-        if av > bv {
-            return false;
-        }
+    if let Some((current_base, current_run, current_attempt)) = parse_fork_version(current) {
+        return remote_base > current_base
+            || (remote_base == current_base && (remote_run, remote_attempt) > (current_run, current_attempt));
     }
-    true // equal
+
+    parse_version_core(current).is_some_and(|current_base| remote_base >= current_base)
 }
 
 /// Maps UI language to one of the three NSIS translations, defaulting to English.
@@ -344,13 +354,12 @@ impl SilentUpdater {
 
         let cached_version = &meta.version;
 
-        if !is_build_to_stable(current_version, cached_version) && version_lte(cached_version, current_version) {
+        if !is_fork_update_available(current_version, cached_version) {
             logging!(
                 info,
                 Type::System,
-                "Update cache version ({}) <= current ({}), cleaning up",
-                cached_version,
-                current_version
+                "Update cache version ({}) is not a newer fork release, cleaning up",
+                cached_version
             );
             Self::delete_cache();
             return false;
@@ -693,5 +702,34 @@ impl SilentUpdater {
 
             tokio::time::sleep(std::time::Duration::from_secs(24 * 60 * 60)).await;
         }
+    }
+}
+
+#[cfg(test)]
+mod fork_version_tests {
+    use super::is_fork_update_available;
+
+    #[test]
+    fn accepts_first_fork_revision_from_same_upstream_version() {
+        assert!(is_fork_update_available("2.5.8", "2.5.8-47lab.10.1"));
+    }
+
+    #[test]
+    fn accepts_newer_fork_run_and_attempt() {
+        assert!(is_fork_update_available("2.5.8-47lab.10.1", "2.5.8-47lab.10.2"));
+        assert!(is_fork_update_available("2.5.8-47lab.9.4", "2.5.8-47lab.10.1"));
+        assert!(!is_fork_update_available("2.5.8-47lab.10.1", "2.5.8-47lab.9.9"));
+        assert!(!is_fork_update_available("2.5.8-47lab.10.1", "2.5.8-47lab.10.1"));
+    }
+
+    #[test]
+    fn accepts_newer_upstream_base_only_for_personal_release() {
+        assert!(is_fork_update_available("2.5.8-47lab.10.1", "2.5.9-47lab.1.1"));
+        assert!(!is_fork_update_available("2.5.8-47lab.10.1", "2.5.9"));
+    }
+
+    #[test]
+    fn migrates_legacy_build_metadata_to_personal_prerelease() {
+        assert!(is_fork_update_available("2.5.8+47lab.abc.r10", "2.5.8-47lab.11.1"));
     }
 }

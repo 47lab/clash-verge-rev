@@ -57,12 +57,15 @@ jobs:
           upstream_sha="$(git rev-parse "${upstream_tag}^{commit}")"
 
           releases="$(gh api --paginate --slurp "repos/${GITHUB_REPOSITORY}/releases?per_page=100")"
-          # shellcheck disable=SC2016 # jq 中的 $tag/$sha 由 jq 解析，不应由 shell 展开
+          # shellcheck disable=SC2016 # jq variables are intentionally supplied via --arg.
           already_published="$(jq -r --arg tag "$upstream_tag" --arg sha "$upstream_sha" '
             flatten
             | any(.[];
                 ((.body // "") | split("\n") | index("Upstream tag: " + $tag)) != null
                 and ((.body // "") | split("\n") | index("Upstream peeled commit SHA: " + $sha)) != null
+                and any(.assets[]?; (.name // "") == "latest.json")
+                and any(.assets[]?; ((.name // "") | endswith(".app.tar.gz")))
+                and any(.assets[]?; ((.name // "") | endswith(".app.tar.gz.sig")))
                 and any(.assets[]?; ((.name // "") | endswith(".dmg")))
                 and .draft == false
                 and .prerelease == false
@@ -106,7 +109,7 @@ jobs:
           fi
 
           release_tag="47lab-${upstream_tag}-${source_sha:0:8}-r${GITHUB_RUN_ID}-a${GITHUB_RUN_ATTEMPT}"
-          custom_version="${upstream_tag#v}+47lab.${source_sha:0:8}.r${GITHUB_RUN_ID}.a${GITHUB_RUN_ATTEMPT}"
+          custom_version="${upstream_tag#v}-47lab.${GITHUB_RUN_NUMBER}.${GITHUB_RUN_ATTEMPT}"
           {
             printf 'should_build=true\n'
             printf 'source_sha=%s\n' "$source_sha"
@@ -119,6 +122,7 @@ jobs:
             printf '## Stable source prepared\n\n'
             printf -- '- Upstream release: %s (%s)\n' "$upstream_tag" "$upstream_sha"
             printf -- '- Build commit: %s\n' "$source_sha"
+            printf -- '- App version: %s\n' "$custom_version"
           } >> "$GITHUB_STEP_SUMMARY"
 
   build:
@@ -127,6 +131,8 @@ jobs:
     runs-on: macos-latest
     permissions:
       contents: read
+    outputs:
+      updater_pubkey: ${{ steps.updater_key.outputs.pubkey }}
     steps:
       - name: Checkout synchronized commit
         uses: actions/checkout@v7
@@ -134,6 +140,10 @@ jobs:
           ref: ${{ needs.sync.outputs.source_sha }}
           fetch-depth: 0
           persist-credentials: false
+
+      - name: Export updater public key
+        id: updater_key
+        run: printf 'pubkey=%s\n' "$(jq -r '.plugins.updater.pubkey' src-tauri/tauri.conf.json)" >> "$GITHUB_OUTPUT"
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@1.99.1
@@ -160,7 +170,7 @@ jobs:
           CUSTOM_VERSION: ${{ needs.sync.outputs.custom_version }}
         run: pnpm release-version "$CUSTOM_VERSION"
 
-      - name: Build macOS ARM64 DMG
+      - name: Build ad-hoc macOS ARM64 DMG and app bundle
         uses: tauri-apps/tauri-action@v1
         env:
           NODE_OPTIONS: '--max_old_space_size=4096'
@@ -168,27 +178,128 @@ jobs:
           tauriScript: pnpm
           args: --target aarch64-apple-darwin -b dmg --config '{"bundle":{"createUpdaterArtifacts":false}}'
 
-      - name: Upload macOS ARM64 DMG
+      - name: Verify app signature and prepare updater archive
+        env:
+          CUSTOM_VERSION: ${{ needs.sync.outputs.custom_version }}
+        run: |
+          set -euo pipefail
+          app_path="$(find target/aarch64-apple-darwin/release/bundle/macos -maxdepth 1 -type d -name '*.app' -print -quit)"
+          if [[ -z "$app_path" ]]; then
+            echo "::error::Tauri build did not produce a macOS app bundle"
+            exit 1
+          fi
+          codesign --verify --deep --strict --verbose=2 "$app_path"
+
+          mkdir -p dist
+          cp target/aarch64-apple-darwin/release/bundle/dmg/*.dmg dist/
+          archive_name="clash-verge-${CUSTOM_VERSION}-aarch64.app.tar.gz"
+          tar -czf "dist/${archive_name}" -C "$(dirname "$app_path")" "$(basename "$app_path")"
+
+      - name: Upload unsigned updater package and DMG
         uses: actions/upload-artifact@v7
         with:
-          name: personal-dmg-${{ needs.sync.outputs.release_tag }}
-          path: target/aarch64-apple-darwin/release/bundle/dmg/*.dmg
+          name: personal-build-${{ needs.sync.outputs.release_tag }}
+          path: |
+            dist/*.dmg
+            dist/*.app.tar.gz
+          if-no-files-found: error
+
+  sign-updater:
+    needs: [sync, build]
+    if: needs.sync.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Download built artifacts
+        uses: actions/download-artifact@v7
+        with:
+          name: personal-build-${{ needs.sync.outputs.release_tag }}
+          path: dist
+
+      - name: Install Tauri signer CLI
+        run: npm install --prefix "$RUNNER_TEMP/tauri-cli" --no-save @tauri-apps/cli@2.12.3
+
+      - name: Install minisign verifier
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes minisign
+
+      - name: Sign updater archive
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ''
+          CUSTOM_VERSION: ${{ needs.sync.outputs.custom_version }}
+        run: |
+          set -euo pipefail
+          archive="dist/clash-verge-${CUSTOM_VERSION}-aarch64.app.tar.gz"
+          signer="$RUNNER_TEMP/tauri-cli/node_modules/.bin/tauri"
+          "$signer" signer sign --app-version "$CUSTOM_VERSION" "$archive"
+          test -s "${archive}.sig"
+
+      - name: Verify generated updater signature
+        env:
+          CUSTOM_VERSION: ${{ needs.sync.outputs.custom_version }}
+          UPDATER_PUBLIC_KEY: ${{ needs.build.outputs.updater_pubkey }}
+        run: |
+          set -euo pipefail
+          archive="dist/clash-verge-${CUSTOM_VERSION}-aarch64.app.tar.gz"
+          public_key="$RUNNER_TEMP/updater.pub"
+          signature="$RUNNER_TEMP/updater.sig"
+          printf '%s' "$UPDATER_PUBLIC_KEY" | base64 --decode > "$public_key"
+          base64 --decode "${archive}.sig" > "$signature"
+          minisign -V -m "$archive" -x "$signature" -p "$public_key"
+
+      - name: Generate updater manifest
+        env:
+          CUSTOM_VERSION: ${{ needs.sync.outputs.custom_version }}
+          RELEASE_TAG: ${{ needs.sync.outputs.release_tag }}
+          UPSTREAM_TAG: ${{ needs.sync.outputs.upstream_tag }}
+          ARCHIVE_NAME: clash-verge-${{ needs.sync.outputs.custom_version }}-aarch64.app.tar.gz
+        run: |
+          set -euo pipefail
+          updater_url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${RELEASE_TAG}/${ARCHIVE_NAME}"
+          pub_date="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+          jq -n \
+            --arg version "$CUSTOM_VERSION" \
+            --arg notes "Personal update based on ${UPSTREAM_TAG}" \
+            --arg pub_date "$pub_date" \
+            --arg url "$updater_url" \
+            --rawfile signature "dist/${ARCHIVE_NAME}.sig" \
+            '{version:$version,notes:$notes,pub_date:$pub_date,platforms:{"darwin-aarch64":{signature:($signature|rtrimstr("\n")),url:$url}}}' \
+            > dist/latest.json
+          jq -e \
+            --arg version "$CUSTOM_VERSION" \
+            --arg url "$updater_url" \
+            --rawfile signature "dist/${ARCHIVE_NAME}.sig" \
+            '.version == $version and .platforms["darwin-aarch64"].url == $url and .platforms["darwin-aarch64"].signature == ($signature | rtrimstr("\n"))' \
+            dist/latest.json > /dev/null
+
+      - name: Upload signed updater artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: personal-signed-${{ needs.sync.outputs.release_tag }}
+          path: |
+            dist/*.dmg
+            dist/*.app.tar.gz
+            dist/*.app.tar.gz.sig
+            dist/latest.json
           if-no-files-found: error
 
   publish:
-    needs: [sync, build]
+    needs: [sync, sign-updater]
     if: needs.sync.outputs.should_build == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
-      - name: Download DMG artifact
+      - name: Download signed release artifacts
         uses: actions/download-artifact@v7
         with:
-          name: personal-dmg-${{ needs.sync.outputs.release_tag }}
+          name: personal-signed-${{ needs.sync.outputs.release_tag }}
           path: dist
 
-      - name: Create draft personal Release and upload DMG
+      - name: Create draft personal Release and upload all artifacts
         id: draft_release
         uses: softprops/action-gh-release@v2
         with:
@@ -204,9 +315,9 @@ jobs:
             Custom source SHA: ${{ needs.sync.outputs.source_sha }}
           draft: true
           prerelease: false
-          make_latest: true
+          make_latest: false
           token: ${{ github.token }}
-          files: dist/*.dmg
+          files: dist/*
           fail_on_unmatched_files: true
 
       - name: Publish Release
