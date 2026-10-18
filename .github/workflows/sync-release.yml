@@ -45,7 +45,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          release_json="$(gh api repos/clash-verge-rev/clash-verge-rev/releases/latest)"
+          release_json="$(curl -fsSL -H 'Accept: application/vnd.github+json' -H 'X-GitHub-Api-Version: 2022-11-28' https://api.github.com/repos/clash-verge-rev/clash-verge-rev/releases/latest)"
           upstream_tag="$(jq -r '.tag_name' <<< "$release_json")"
           if [[ ! "$upstream_tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             echo "::error::Latest official release has an unexpected tag: $upstream_tag"
@@ -121,18 +121,19 @@ jobs:
             printf -- '- Build commit: %s\n' "$source_sha"
           } >> "$GITHUB_STEP_SUMMARY"
 
-  build-and-release:
+  build:
     needs: sync
     if: needs.sync.outputs.should_build == 'true'
     runs-on: macos-latest
     permissions:
-      contents: write
+      contents: read
     steps:
       - name: Checkout synchronized commit
         uses: actions/checkout@v7
         with:
           ref: ${{ needs.sync.outputs.source_sha }}
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@1.99.1
@@ -163,13 +164,32 @@ jobs:
         uses: tauri-apps/tauri-action@v1
         env:
           NODE_OPTIONS: '--max_old_space_size=4096'
-          GITHUB_TOKEN: ${{ github.token }}
         with:
           tauriScript: pnpm
           args: --target aarch64-apple-darwin -b dmg --config '{"bundle":{"createUpdaterArtifacts":false}}'
 
-      - name: Publish personal Release
-        id: publish
+      - name: Upload macOS ARM64 DMG
+        uses: actions/upload-artifact@v7
+        with:
+          name: personal-dmg-${{ needs.sync.outputs.release_tag }}
+          path: target/aarch64-apple-darwin/release/bundle/dmg/*.dmg
+          if-no-files-found: error
+
+  publish:
+    needs: [sync, build]
+    if: needs.sync.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download DMG artifact
+        uses: actions/download-artifact@v7
+        with:
+          name: personal-dmg-${{ needs.sync.outputs.release_tag }}
+          path: dist
+
+      - name: Create draft personal Release and upload DMG
+        id: draft_release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ needs.sync.outputs.release_tag }}
@@ -182,11 +202,22 @@ jobs:
             Upstream tag: ${{ needs.sync.outputs.upstream_tag }}
             Upstream peeled commit SHA: ${{ needs.sync.outputs.upstream_sha }}
             Custom source SHA: ${{ needs.sync.outputs.source_sha }}
+          draft: true
           prerelease: false
           make_latest: true
           token: ${{ github.token }}
-          files: target/aarch64-apple-darwin/release/bundle/dmg/*.dmg
+          files: dist/*.dmg
           fail_on_unmatched_files: true
+
+      - name: Publish Release
+        id: publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_ID: ${{ steps.draft_release.outputs.id }}
+        run: |
+          set -euo pipefail
+          release_json="$(gh api --method PATCH "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}" -F draft=false -f make_latest=true)"
+          printf 'url=%s\n' "$(jq -r '.html_url' <<< "$release_json")" >> "$GITHUB_OUTPUT"
 
       - name: Write Release summary
         if: always()
@@ -196,10 +227,12 @@ jobs:
           UPSTREAM_TAG: ${{ needs.sync.outputs.upstream_tag }}
           UPSTREAM_SHA: ${{ needs.sync.outputs.upstream_sha }}
           SOURCE_SHA: ${{ needs.sync.outputs.source_sha }}
+          CUSTOM_VERSION: ${{ needs.sync.outputs.custom_version }}
         run: |
           {
             printf '## Personal macOS Release\n\n'
             printf -- '- Status: %s\n' "$BUILD_STATUS"
+            printf -- '- App version: %s\n' "$CUSTOM_VERSION"
             printf -- '- Upstream: [%s](https://github.com/clash-verge-rev/clash-verge-rev/releases/tag/%s) (%s)\n' "$UPSTREAM_TAG" "$UPSTREAM_TAG" "$UPSTREAM_SHA"
             printf -- '- Source commit: %s\n' "$SOURCE_SHA"
             if [[ -n "$RELEASE_URL" ]]; then
