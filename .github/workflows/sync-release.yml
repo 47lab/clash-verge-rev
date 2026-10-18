@@ -182,7 +182,7 @@ jobs:
           NODE_OPTIONS: '--max_old_space_size=4096'
         with:
           tauriScript: pnpm
-          args: --target aarch64-apple-darwin -b dmg --config '{"bundle":{"createUpdaterArtifacts":false}}'
+          args: --target aarch64-apple-darwin -b app,dmg --config '{"bundle":{"createUpdaterArtifacts":false}}'
 
       - name: Verify app signature and prepare updater archive
         env:
