@@ -165,6 +165,12 @@ jobs:
           pnpm install --frozen-lockfile
           pnpm run prebuild aarch64-apple-darwin
 
+      - name: Run updater version unit tests
+        run: pnpm exec vitest run src/services/update.test.ts
+
+      - name: Run Rust updater version unit tests
+        run: cargo test --manifest-path src-tauri/Cargo.toml --locked --features clippy --lib core::updater::fork_version_tests
+
       - name: Set unique personal version
         env:
           CUSTOM_VERSION: ${{ needs.sync.outputs.custom_version }}
