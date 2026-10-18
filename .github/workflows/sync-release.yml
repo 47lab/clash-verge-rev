@@ -1,0 +1,210 @@
+name: Sync Official Stable Release
+
+on:
+  schedule:
+    - cron: '17 2 * * *'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: '强制为当前上游版本重新构建并发布'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: personal-stable-release
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      should_build: ${{ steps.sync.outputs.should_build }}
+      source_sha: ${{ steps.sync.outputs.source_sha }}
+      upstream_tag: ${{ steps.sync.outputs.upstream_tag }}
+      upstream_sha: ${{ steps.sync.outputs.upstream_sha }}
+      release_tag: ${{ steps.sync.outputs.release_tag }}
+      custom_version: ${{ steps.sync.outputs.custom_version }}
+    steps:
+      - name: Checkout personal main
+        uses: actions/checkout@v7
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Sync latest official release
+        id: sync
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FORCE: ${{ inputs.force || false }}
+        run: |
+          set -euo pipefail
+
+          release_json="$(gh api repos/clash-verge-rev/clash-verge-rev/releases/latest)"
+          upstream_tag="$(jq -r '.tag_name' <<< "$release_json")"
+          if [[ ! "$upstream_tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Latest official release has an unexpected tag: $upstream_tag"
+            exit 1
+          fi
+
+          git remote add upstream https://github.com/clash-verge-rev/clash-verge-rev.git
+          git fetch --no-tags upstream "refs/tags/${upstream_tag}:refs/tags/${upstream_tag}"
+          upstream_sha="$(git rev-parse "${upstream_tag}^{commit}")"
+
+          releases="$(gh api --paginate --slurp "repos/${GITHUB_REPOSITORY}/releases?per_page=100")"
+          # shellcheck disable=SC2016 # jq 中的 $tag/$sha 由 jq 解析，不应由 shell 展开
+          already_published="$(jq -r --arg tag "$upstream_tag" --arg sha "$upstream_sha" '
+            flatten
+            | any(.[];
+                ((.body // "") | split("\n") | index("Upstream tag: " + $tag)) != null
+                and ((.body // "") | split("\n") | index("Upstream peeled commit SHA: " + $sha)) != null
+                and any(.assets[]?; ((.name // "") | endswith(".dmg")))
+                and .draft == false
+                and .prerelease == false
+              )
+          ' <<< "$releases")"
+
+          git switch -C main origin/main
+          if [[ "$FORCE" != "true" && "$already_published" == "true" ]]; then
+            source_sha="$(git rev-parse HEAD)"
+            {
+              printf 'should_build=false\n'
+              printf 'source_sha=%s\n' "$source_sha"
+              printf 'upstream_tag=%s\n' "$upstream_tag"
+              printf 'upstream_sha=%s\n' "$upstream_sha"
+              printf 'release_tag=\n'
+              printf 'custom_version=\n'
+            } >> "$GITHUB_OUTPUT"
+            {
+              printf '## No new official release\n\n'
+              printf -- '- Already published upstream tag: %s\n' "$upstream_tag"
+              printf -- '- Releases: [open list](https://github.com/%s/releases)\n' "$GITHUB_REPOSITORY"
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          before_sha="$(git rev-parse HEAD)"
+          if ! git merge-base --is-ancestor "$upstream_sha" HEAD; then
+            if ! git merge --no-ff --no-edit "$upstream_sha"; then
+              git merge --abort || true
+              printf '## Upstream merge conflict\n\nUnable to merge %s into main; no build or release was started.\n' "$upstream_tag" >> "$GITHUB_STEP_SUMMARY"
+              echo "::error::Merge conflict while syncing official release $upstream_tag; resolve manually."
+              exit 1
+            fi
+          fi
+
+          source_sha="$(git rev-parse HEAD)"
+          if [[ "$source_sha" != "$before_sha" ]]; then
+            git push origin "$source_sha:refs/heads/main"
+          fi
+
+          release_tag="47lab-${upstream_tag}-${source_sha:0:8}-r${GITHUB_RUN_ID}-a${GITHUB_RUN_ATTEMPT}"
+          custom_version="${upstream_tag#v}+47lab.${source_sha:0:8}.r${GITHUB_RUN_ID}.a${GITHUB_RUN_ATTEMPT}"
+          {
+            printf 'should_build=true\n'
+            printf 'source_sha=%s\n' "$source_sha"
+            printf 'upstream_tag=%s\n' "$upstream_tag"
+            printf 'upstream_sha=%s\n' "$upstream_sha"
+            printf 'release_tag=%s\n' "$release_tag"
+            printf 'custom_version=%s\n' "$custom_version"
+          } >> "$GITHUB_OUTPUT"
+          {
+            printf '## Stable source prepared\n\n'
+            printf -- '- Upstream release: %s (%s)\n' "$upstream_tag" "$upstream_sha"
+            printf -- '- Build commit: %s\n' "$source_sha"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  build-and-release:
+    needs: sync
+    if: needs.sync.outputs.should_build == 'true'
+    runs-on: macos-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout synchronized commit
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.sync.outputs.source_sha }}
+          fetch-depth: 0
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@1.99.1
+        with:
+          targets: aarch64-apple-darwin
+
+      - name: Install Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: '24.22.0'
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v6
+        with:
+          run_install: false
+
+      - name: Install dependencies and prepare sidecars
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm run prebuild aarch64-apple-darwin
+
+      - name: Set unique personal version
+        env:
+          CUSTOM_VERSION: ${{ needs.sync.outputs.custom_version }}
+        run: pnpm release-version "$CUSTOM_VERSION"
+
+      - name: Build macOS ARM64 DMG
+        uses: tauri-apps/tauri-action@v1
+        env:
+          NODE_OPTIONS: '--max_old_space_size=4096'
+          GITHUB_TOKEN: ${{ github.token }}
+        with:
+          tauriScript: pnpm
+          args: --target aarch64-apple-darwin -b dmg --config '{"bundle":{"createUpdaterArtifacts":false}}'
+
+      - name: Publish personal Release
+        id: publish
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.sync.outputs.release_tag }}
+          target_commitish: ${{ needs.sync.outputs.source_sha }}
+          name: Clash Verge Rev ${{ needs.sync.outputs.custom_version }}
+          body: |
+            Personal macOS ARM64 build.
+
+            App version: ${{ needs.sync.outputs.custom_version }}
+            Upstream tag: ${{ needs.sync.outputs.upstream_tag }}
+            Upstream peeled commit SHA: ${{ needs.sync.outputs.upstream_sha }}
+            Custom source SHA: ${{ needs.sync.outputs.source_sha }}
+          prerelease: false
+          make_latest: true
+          token: ${{ github.token }}
+          files: target/aarch64-apple-darwin/release/bundle/dmg/*.dmg
+          fail_on_unmatched_files: true
+
+      - name: Write Release summary
+        if: always()
+        env:
+          RELEASE_URL: ${{ steps.publish.outputs.url }}
+          BUILD_STATUS: ${{ job.status }}
+          UPSTREAM_TAG: ${{ needs.sync.outputs.upstream_tag }}
+          UPSTREAM_SHA: ${{ needs.sync.outputs.upstream_sha }}
+          SOURCE_SHA: ${{ needs.sync.outputs.source_sha }}
+        run: |
+          {
+            printf '## Personal macOS Release\n\n'
+            printf -- '- Status: %s\n' "$BUILD_STATUS"
+            printf -- '- Upstream: [%s](https://github.com/clash-verge-rev/clash-verge-rev/releases/tag/%s) (%s)\n' "$UPSTREAM_TAG" "$UPSTREAM_TAG" "$UPSTREAM_SHA"
+            printf -- '- Source commit: %s\n' "$SOURCE_SHA"
+            if [[ -n "$RELEASE_URL" ]]; then
+              printf -- '- Release: [%s](%s)\n' "$RELEASE_URL" "$RELEASE_URL"
+            else
+              printf -- '- Release: not published\n'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

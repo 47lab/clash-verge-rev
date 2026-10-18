@@ -168,25 +168,11 @@ async fn init_auto_backup() {
 }
 
 async fn init_silent_updater() {
-    use crate::core::SilentUpdater;
-    use crate::core::handle::Handle;
-
-    logging!(debug, Type::Setup, "Initializing silent updater...");
-
-    let app_handle = Handle::app_handle();
-
-    // Install cached updates before starting background checks.
-    if SilentUpdater::global().try_install_on_startup(app_handle).await {
-        logging!(info, Type::Setup, "Update installed at startup, restarting...");
-        feat::restart_app().await;
-    }
-
-    let app_handle = app_handle.clone();
-    tokio::spawn(async move {
-        SilentUpdater::global().start_background_check(app_handle).await;
-    });
-
-    logging!(info, Type::Setup, "Silent updater initialized");
+    logging!(
+        info,
+        Type::Setup,
+        "个人稳定版已关闭后台自动更新，请从 GitHub Release 手动下载安装"
+    );
 }
 
 pub(crate) fn init_signal() {

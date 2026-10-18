@@ -277,7 +277,52 @@ fn start_embedded_server(listener: tokio::net::TcpListener, token: String) {
             Ok::<_, warp::Rejection>(warp::reply::with_status("ok".to_string(), warp::http::StatusCode::OK))
         });
 
-    let commands = auth.clone().and(visible).or(auth.and(scheme)).or(pac);
+    let reload = warp::path!("commands" / "reload").and(warp::get()).and_then(|| async {
+        if !COMMANDS_READY.load(Ordering::Acquire) {
+            return Ok::<_, warp::Rejection>(warp::reply::with_status(
+                warp::reply::json(&serde_json::json!({
+                    "status": "error",
+                    "message": "embedded server is starting"
+                })),
+                warp::http::StatusCode::SERVICE_UNAVAILABLE,
+            ));
+        }
+
+        match crate::feat::enhance_profiles().await {
+            Ok(outcome) if outcome.is_valid() => {
+                crate::core::notify::handle::Handle::refresh_clash();
+                Ok(warp::reply::with_status(
+                    warp::reply::json(&serde_json::json!({
+                        "status": "ok",
+                        "outcome": outcome
+                    })),
+                    warp::http::StatusCode::OK,
+                ))
+            }
+            Ok(outcome) => Ok(warp::reply::with_status(
+                warp::reply::json(&serde_json::json!({
+                    "status": "error",
+                    "message": outcome.to_string(),
+                    "outcome": outcome
+                })),
+                warp::http::StatusCode::BAD_REQUEST,
+            )),
+            Err(error) => Ok(warp::reply::with_status(
+                warp::reply::json(&serde_json::json!({
+                    "status": "error",
+                    "message": error.to_string()
+                })),
+                warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+            )),
+        }
+    });
+
+    let commands = auth
+        .clone()
+        .and(visible)
+        .or(auth.clone().and(scheme))
+        .or(auth.and(reload))
+        .or(pac);
     #[cfg(feature = "verge-dev")]
     let commands = commands.or(dev_quit_route(token, &COMMANDS_READY, &DEV_QUIT_REQUESTED, || {
         AsyncHandler::spawn(|| async {
