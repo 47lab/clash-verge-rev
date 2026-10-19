@@ -29,6 +29,7 @@ impl SilentUpdater {
         }
     }
 
+    #[allow(dead_code, reason = "静默后台更新已明确停用，保留兼容实现")]
     pub fn is_update_ready(&self) -> bool {
         self.update_ready.load(Ordering::Acquire)
     }
@@ -45,6 +46,7 @@ impl SilentUpdater {
         Ok(dirs::app_home_dir()?.join("update_cache"))
     }
 
+    #[allow(dead_code, reason = "静默后台更新已明确停用，保留兼容实现")]
     fn write_cache(bytes: &[u8], version: &str) -> Result<()> {
         let cache_dir = Self::cache_dir()?;
         std::fs::create_dir_all(&cache_dir)
@@ -206,8 +208,9 @@ pub fn is_fork_update_available(current: &str, remote: &str) -> bool {
     };
 
     if let Some((current_base, current_run, current_attempt)) = parse_fork_version(current) {
-        return remote_base > current_base
-            || (remote_base == current_base && (remote_run, remote_attempt) > (current_run, current_attempt));
+        let remote_revision = (remote_base, remote_run, remote_attempt);
+        let current_revision = (current_base, current_run, current_attempt);
+        return remote_revision > current_revision;
     }
 
     parse_version_core(current).is_some_and(|current_base| remote_base >= current_base)
@@ -339,6 +342,7 @@ impl SilentUpdater {
     }
 
     /// Installs a newer cached update before normal startup, if the user confirms.
+    #[allow(dead_code, reason = "静默后台更新已明确停用，保留兼容实现")]
     pub async fn try_install_on_startup(&self, app_handle: &tauri::AppHandle) -> bool {
         if !Config::verge().await.latest_arc().auto_check_update.unwrap_or(true) {
             Self::delete_cache();
@@ -495,6 +499,7 @@ impl SilentUpdater {
 }
 
 impl SilentUpdater {
+    #[allow(dead_code, reason = "静默后台更新已明确停用，保留兼容实现")]
     async fn ask_user_to_install(app_handle: &tauri::AppHandle, version: &str) -> bool {
         use tauri_plugin_dialog::{DialogExt as _, MessageDialogButtons, MessageDialogKind};
 
@@ -521,6 +526,7 @@ impl SilentUpdater {
 
 impl SilentUpdater {
     /// Uses injected HTML so the splash has no bundled-file dependency.
+    #[allow(dead_code, reason = "静默后台更新已明确停用，保留兼容实现")]
     fn show_update_splash(app_handle: &tauri::AppHandle, version: &str) {
         use tauri::{WebviewUrl, WebviewWindowBuilder};
 
@@ -592,6 +598,7 @@ impl SilentUpdater {
         logging!(info, Type::System, "Update splash window shown");
     }
 
+    #[allow(dead_code, reason = "静默后台更新已明确停用，保留兼容实现")]
     fn close_update_splash(app_handle: &tauri::AppHandle) {
         use tauri::Manager as _;
         if let Some(window) = app_handle.get_webview_window("update-splash") {
@@ -602,6 +609,7 @@ impl SilentUpdater {
 }
 
 impl SilentUpdater {
+    #[allow(dead_code, reason = "静默后台更新已明确停用，保留兼容实现")]
     async fn check_and_download(&self, app_handle: &tauri::AppHandle) -> Result<()> {
         // Registered before reading the switch, so `discard_pending` either cancels it or ran first.
         let cancel = CancellationToken::new();
@@ -689,6 +697,7 @@ impl SilentUpdater {
         Ok(())
     }
 
+    #[allow(dead_code, reason = "静默后台更新已明确停用，保留兼容实现")]
     pub async fn start_background_check(&self, app_handle: tauri::AppHandle) {
         // Permanent watcher: daily update cycles for the lifetime of the app.
         logging!(info, Type::System, "Silent updater: background task started");

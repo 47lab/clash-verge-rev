@@ -167,11 +167,12 @@ async fn init_auto_backup() {
     logging_error!(Type::Setup, AutoBackupManager::global().init().await);
 }
 
+#[allow(clippy::unused_async, reason = "保持共享启动初始化接口形状")]
 async fn init_silent_updater() {
     logging!(
         info,
         Type::Setup,
-        "个人稳定版已关闭后台自动更新，请从 GitHub Release 手动下载安装"
+        "个人稳定版已停用静默下载安装，请在设置中手动检查更新"
     );
 }
 
