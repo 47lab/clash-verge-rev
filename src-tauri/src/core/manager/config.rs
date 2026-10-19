@@ -88,6 +88,19 @@ fn plan_config_application(attempt: &StageAttempt) -> ConfigApplication {
     }
 }
 
+fn plan_config_reload_without_restart(attempt: &StageAttempt) -> Result<std::string::String, std::string::String> {
+    match attempt {
+        StageAttempt::Answered(StageRuntimeOutcome::Staged { config_path }) => Ok(config_path.clone()),
+        StageAttempt::Answered(StageRuntimeOutcome::RestartRequired { reason }) => {
+            Err(format!("服务要求重启核心才能应用配置，但当前已禁用重启：{reason:?}"))
+        }
+        StageAttempt::RefusedTheBundle(message) => Err(format!("服务拒绝了待应用配置，且已禁用核心重启：{message}")),
+        StageAttempt::RefusedForAnotherReason(message) => Err(format!("服务拒绝热重载，且已禁用核心重启：{message}")),
+        StageAttempt::Unanswered(error) => Err(format!("未能确认服务热重载结果，且已禁用核心重启：{error}")),
+        StageAttempt::Unsupported => Err("当前服务不支持原地暂存，且已禁用核心重启".into()),
+    }
+}
+
 async fn ask_to_stage(path: &std::path::Path) -> StageAttempt {
     match crate::core::service::stage_runtime_by_service(path).await {
         Ok(StageRequest::Answered(outcome)) => StageAttempt::Answered(outcome),
@@ -147,7 +160,7 @@ impl CoreManager {
         }
         self.set_last_update(Instant::now());
         Config::generate().await?;
-        let outcome = self.validate_and_apply_draft().await?;
+        let outcome = self.validate_and_apply_draft(true).await?;
         if outcome.is_valid() {
             Ok(())
         } else {
@@ -179,8 +192,18 @@ impl CoreManager {
         self.update_config_with_force(true).await
     }
 
+    /// 外部 Profile 热重载专用：Mihomo 原地重载失败时返回错误，不重启核心。
+    pub async fn update_config_forced_without_restart(&self) -> Result<ValidationOutcome> {
+        self.update_config_with_force_mode(true, false).await
+    }
+
     #[tracing::instrument(skip_all, level = "info", fields(force))]
     pub async fn update_config_with_force(&self, force: bool) -> Result<ValidationOutcome> {
+        self.update_config_with_force_mode(force, true).await
+    }
+
+    #[tracing::instrument(skip_all, level = "info", fields(force, restart_on_failure))]
+    async fn update_config_with_force_mode(&self, force: bool, restart_on_failure: bool) -> Result<ValidationOutcome> {
         if handle::Handle::global().is_exiting() {
             return Ok(ValidationOutcome::Skipped {
                 reason: ValidationSkipReason::Exiting,
@@ -206,7 +229,13 @@ impl CoreManager {
             self.set_last_update(Instant::now());
         }
 
-        self.perform_config_update(None).await
+        if !restart_on_failure {
+            Config::reload_clash_config_from_file()
+                .await
+                .map_err(|error| anyhow!("热重载前读取 clash 配置失败：{error:#}"))?;
+        }
+
+        self.perform_config_update(None, restart_on_failure).await
     }
 
     #[tracing::instrument(skip_all, level = "info", fields(profile = ?candidate.current, outcome = tracing::field::Empty))]
@@ -228,7 +257,7 @@ impl CoreManager {
         crate::config::profiles::supersede_selected_activation();
 
         let outcome = match PROFILE_SELECTIONS_PENDING_COMMIT
-            .scope(true, self.perform_config_update(Some(candidate)))
+            .scope(true, self.perform_config_update(Some(candidate), true))
             .await
         {
             Ok(outcome) => outcome,
@@ -257,7 +286,7 @@ impl CoreManager {
     }
 
     async fn restore_profile_config(&self, profiles: &IProfiles) -> Result<()> {
-        let outcome = self.perform_config_update(Some(profiles)).await?;
+        let outcome = self.perform_config_update(Some(profiles), true).await?;
         if outcome.is_valid() {
             crate::config::profiles::restore_selected_nodes().await;
             handle::Handle::refresh_clash();
@@ -290,7 +319,11 @@ impl CoreManager {
         true
     }
 
-    async fn perform_config_update(&self, profiles: Option<&IProfiles>) -> Result<ValidationOutcome> {
+    async fn perform_config_update(
+        &self,
+        profiles: Option<&IProfiles>,
+        restart_on_failure: bool,
+    ) -> Result<ValidationOutcome> {
         let runtime = Config::runtime().await;
         let transaction = DraftTransaction::begin(vec![&runtime])?;
 
@@ -303,7 +336,7 @@ impl CoreManager {
             return Ok(ValidationOutcome::invalid_from_message(message));
         }
 
-        self.validate_and_apply(transaction).await
+        self.validate_and_apply(transaction, restart_on_failure).await
     }
 
     pub(crate) async fn update_runtime_config<F>(&self, f: F) -> Result<ValidationOutcome>
@@ -321,14 +354,18 @@ impl CoreManager {
         let runtime = Config::runtime().await;
         let transaction = DraftTransaction::begin(vec![&runtime])?;
         runtime.edit_draft(f);
-        self.validate_and_apply(transaction).await
+        self.validate_and_apply(transaction, true).await
     }
 
     /// Commits the applied runtime even if restoring the system proxy subsequently fails.
-    async fn validate_and_apply(&self, transaction: DraftTransaction<'_>) -> Result<ValidationOutcome> {
+    async fn validate_and_apply(
+        &self,
+        transaction: DraftTransaction<'_>,
+        restart_on_failure: bool,
+    ) -> Result<ValidationOutcome> {
         let runtime = Config::runtime().await;
         let original_runtime = runtime.data_arc();
-        let outcome = match self.validate_and_apply_draft().await {
+        let outcome = match self.validate_and_apply_draft(restart_on_failure).await {
             Ok(outcome) => outcome,
             Err(error) => {
                 transaction.rollback();
@@ -344,7 +381,7 @@ impl CoreManager {
         Ok(outcome)
     }
 
-    async fn validate_and_apply_draft(&self) -> Result<ValidationOutcome> {
+    async fn validate_and_apply_draft(&self, restart_on_failure: bool) -> Result<ValidationOutcome> {
         // One serialization feeds check and run files; the core never applies unvalidated bytes.
         let yaml = Config::runtime_config_yaml().await?;
         let outcome = CoreConfigValidator::global()
@@ -356,7 +393,7 @@ impl CoreManager {
 
         let run_path = Config::write_runtime_file(&yaml).await?;
         let previous = self.current_core_readiness_generation();
-        let result = self.apply_config(run_path).await;
+        let result = self.apply_config(run_path, restart_on_failure).await;
         self.retain_applied_runtime(&Config::runtime().await, previous, &result);
         result?;
         // Under the lifecycle lock, so a stop for exit waits for this write instead of outrunning it.
@@ -384,17 +421,39 @@ impl CoreManager {
     }
 
     /// Applies a generated configuration through the active core owner.
-    async fn apply_config(&self, path: PathBuf) -> Result<()> {
+    async fn apply_config(&self, path: PathBuf, restart_on_failure: bool) -> Result<()> {
         if matches!(*self.get_running_mode(), RunningMode::Service) {
             let _lifecycle = self.lifecycle_lock.lock().await;
             if !matches!(*self.get_running_mode(), RunningMode::Service) {
                 return Err(anyhow!("core mode changed while applying service configuration"));
             }
-            return self.apply_config_by_service(&path).await;
+            return if restart_on_failure {
+                self.apply_config_by_service(&path).await
+            } else {
+                self.apply_config_by_service_without_restart(&path).await
+            };
         }
 
         let path = dirs::path_to_str(&path)?;
-        self.reload_or_restart(path).await
+        if restart_on_failure {
+            self.reload_or_restart(path).await
+        } else {
+            self.reload_config(path)
+                .await
+                .map_err(|error| anyhow!("Mihomo 热重载失败，已禁用核心重启：{error}"))
+        }
+    }
+
+    /// 通过服务原地重载配置；不支持或重载失败时直接返回错误。
+    /// 调用方必须持有 `lifecycle_lock`。
+    async fn apply_config_by_service_without_restart(&self, path: &std::path::Path) -> Result<()> {
+        let staged_path = plan_config_reload_without_restart(&self.attempt_staging(path).await)
+            .map_err(|message| anyhow!("{message}"))?;
+        self.reload_config(&staged_path)
+            .await
+            .map_err(|error| anyhow!("服务核心热重载失败，已禁用核心重启：{error}"))?;
+        crate::core::service::request_runtime_provider_sync(timing::RUNTIME_PROVIDER_SYNC_DELAY);
+        Ok(())
     }
 
     /// Applies through the service, replacing the core when in-place staging is unavailable.
@@ -470,7 +529,10 @@ impl CoreManager {
 
 #[cfg(test)]
 mod tests {
-    use super::{ConfigApplication, StageAttempt, StageRequest, plan_config_application, stage_with_confirmation};
+    use super::{
+        ConfigApplication, StageAttempt, StageRequest, plan_config_application, plan_config_reload_without_restart,
+        stage_with_confirmation,
+    };
     use clash_verge_service_ipc::{StageRejection, StageRuntimeOutcome};
     use std::{cell::Cell, time::Duration};
 
@@ -505,6 +567,26 @@ mod tests {
         StageAttempt::Answered(StageRuntimeOutcome::Staged {
             config_path: "/service/runtime.generation-1/config.yaml".to_owned(),
         })
+    }
+
+    #[test]
+    fn strict_hot_reload_only_accepts_a_staged_service_runtime() {
+        assert!(plan_config_reload_without_restart(&staged()).is_ok());
+
+        for attempt in [
+            StageAttempt::Unsupported,
+            StageAttempt::Answered(StageRuntimeOutcome::RestartRequired {
+                reason: StageRejection::CoreNotRunning,
+            }),
+            StageAttempt::RefusedTheBundle("配置包被拒绝".into()),
+            StageAttempt::RefusedForAnotherReason("服务拒绝暂存".into()),
+            StageAttempt::Unanswered("服务没有返回结果".into()),
+        ] {
+            assert!(
+                plan_config_reload_without_restart(&attempt).is_err(),
+                "严格热重载不得退化为重启核心"
+            );
+        }
     }
 
     /// Exhaustively maps every service rejection into the policy under test.

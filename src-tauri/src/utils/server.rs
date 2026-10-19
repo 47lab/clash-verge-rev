@@ -207,14 +207,69 @@ fn release_dev_quit_latch(quit_requested: &AtomicBool, outcome: clash_verge_sign
     }
 }
 
+fn current_mihomo_ipc_path() -> Option<String> {
+    let path = match *crate::core::CoreManager::global().get_running_mode() {
+        crate::core::manager::RunningMode::Service => dirs::ipc_path().ok(),
+        crate::core::manager::RunningMode::Sidecar => dirs::sidecar_ipc_path().ok(),
+        crate::core::manager::RunningMode::NotRunning => None,
+    }?;
+    dirs::path_to_str(&path).ok().map(str::to_owned)
+}
+
 fn start_embedded_server(listener: tokio::net::TcpListener, token: String) {
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let _ = SHUTDOWN_SENDER.set(Mutex::new(Some(shutdown_tx)));
 
-    #[cfg(feature = "verge-dev")]
     let auth = instance_auth(token.clone());
-    #[cfg(not(feature = "verge-dev"))]
-    let auth = instance_auth(token);
+    let identity_token = token.clone();
+
+    let identity = warp::path!("commands" / "identity")
+        .and(warp::get())
+        .and(warp::header::optional::<String>(INSTANCE_TOKEN_HEADER))
+        .and_then(move |provided: Option<String>| {
+            let token = identity_token.clone();
+            async move {
+                if provided.as_deref() != Some(token.as_str()) {
+                    return Ok::<_, warp::Rejection>(warp::reply::with_status(
+                        warp::reply::json(&serde_json::json!({
+                            "status": "error",
+                            "message": "singleton 实例令牌无效"
+                        })),
+                        warp::http::StatusCode::UNAUTHORIZED,
+                    ));
+                }
+                if !COMMANDS_READY.load(Ordering::Acquire) {
+                    return Ok(warp::reply::with_status(
+                        warp::reply::json(&serde_json::json!({
+                            "status": "error",
+                            "message": "嵌入式服务正在启动"
+                        })),
+                        warp::http::StatusCode::SERVICE_UNAVAILABLE,
+                    ));
+                }
+                let profiles = Config::profiles().await.latest_arc();
+                let current_profile_uid = profiles.current.clone();
+                let current_profile_file = current_profile_uid
+                    .as_ref()
+                    .and_then(|uid| profiles.get_item(uid).ok())
+                    .and_then(|item| item.file.clone());
+                let mihomo_ipc_path = current_mihomo_ipc_path();
+                Ok(warp::reply::with_status(
+                    warp::reply::json(&serde_json::json!({
+                        "appVersion": env!("CARGO_PKG_VERSION"),
+                        "bundleIdentifier": crate::utils::dirs::APP_ID,
+                        "currentProfileUid": current_profile_uid,
+                        "currentProfileFile": current_profile_file,
+                        "mihomoIpcPath": mihomo_ipc_path,
+                        "capabilities": {
+                            "profileReloadNoRestart": true,
+                            "profileReloadProtocol": "47lab-strict-v1"
+                        }
+                    })),
+                    warp::http::StatusCode::OK,
+                ))
+            }
+        });
 
     let visible = warp::path!("commands" / "visible").and_then(|| async {
         if !COMMANDS_READY.load(Ordering::Acquire) {
@@ -282,19 +337,27 @@ fn start_embedded_server(listener: tokio::net::TcpListener, token: String) {
             return Ok::<_, warp::Rejection>(warp::reply::with_status(
                 warp::reply::json(&serde_json::json!({
                     "status": "error",
-                    "message": "embedded server is starting"
+                    "message": "嵌入式服务正在启动"
                 })),
                 warp::http::StatusCode::SERVICE_UNAVAILABLE,
             ));
         }
 
-        match crate::feat::enhance_profiles().await {
+        match crate::feat::enhance_profiles_without_restart().await {
             Ok(outcome) if outcome.is_valid() => {
                 crate::core::notify::handle::Handle::refresh_clash();
+                let profiles = Config::profiles().await.latest_arc();
+                let current_profile_uid = profiles.current.clone();
+                let current_profile_file = current_profile_uid
+                    .as_ref()
+                    .and_then(|uid| profiles.get_item(uid).ok())
+                    .and_then(|item| item.file.clone());
                 Ok(warp::reply::with_status(
                     warp::reply::json(&serde_json::json!({
                         "status": "ok",
-                        "outcome": outcome
+                        "outcome": outcome,
+                        "currentProfileUid": current_profile_uid,
+                        "currentProfileFile": current_profile_file
                     })),
                     warp::http::StatusCode::OK,
                 ))
@@ -321,7 +384,8 @@ fn start_embedded_server(listener: tokio::net::TcpListener, token: String) {
         .clone()
         .and(visible)
         .or(auth.clone().and(scheme))
-        .or(auth.and(reload))
+        .or(auth.clone().and(reload))
+        .or(identity)
         .or(pac);
     #[cfg(feature = "verge-dev")]
     let commands = commands.or(dev_quit_route(token, &COMMANDS_READY, &DEV_QUIT_REQUESTED, || {

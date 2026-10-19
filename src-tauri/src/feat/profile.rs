@@ -253,3 +253,12 @@ pub async fn enhance_profiles() -> Result<ValidationOutcome> {
     }
     Ok(outcome)
 }
+
+/// 为部署脚本提供严格热重载：Mihomo 应用失败时不自动重启核心。
+pub async fn enhance_profiles_without_restart() -> Result<ValidationOutcome> {
+    let outcome = CoreManager::global().update_config_forced_without_restart().await?;
+    if outcome.is_valid() {
+        logging_error!(Type::Config, Config::sync_dns_override().await);
+    }
+    Ok(outcome)
+}

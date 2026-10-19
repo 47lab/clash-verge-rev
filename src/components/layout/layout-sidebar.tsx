@@ -1,5 +1,5 @@
 import { DragDropProvider, KeyboardSensor, PointerSensor } from '@dnd-kit/react'
-import { Box, List, Menu, MenuItem, SvgIcon } from '@mui/material'
+import { Box, List, Menu, MenuItem, SvgIcon, Typography } from '@mui/material'
 import { useCallback, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 
@@ -146,6 +146,26 @@ export const LayoutSidebar = (props: LayoutSidebarProps) => {
           />
           <LogoSvg fill={isDark ? 'white' : 'black'} />
         </div>
+        <Typography
+          className="the-logo__badge"
+          variant="caption"
+          sx={{
+            ml: 4.75,
+            mt: -0.25,
+            px: 0.6,
+            py: 0.15,
+            border: '1px solid',
+            borderColor: 'divider',
+            borderRadius: 1,
+            fontSize: 10,
+            fontWeight: 700,
+            lineHeight: 1,
+            letterSpacing: '0.06em',
+            color: 'text.secondary',
+          }}
+        >
+          47lab
+        </Typography>
         <UpdateButton className="the-newbtn" />
       </div>
 

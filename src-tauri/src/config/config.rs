@@ -53,6 +53,15 @@ impl Config {
         Self::global().await.clash_config.clone()
     }
 
+    pub(crate) async fn reload_clash_config_from_file() -> Result<()> {
+        let _config_write = Self::lock_config_write().await;
+        let restored = IClashTemp::try_new().await?;
+        let clash = Self::clash().await;
+        clash.edit_draft(|draft| *draft = restored.clone());
+        clash.apply();
+        Ok(())
+    }
+
     pub async fn verge() -> Draft<IVerge> {
         Self::global().await.verge_config.clone()
     }

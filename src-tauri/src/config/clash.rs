@@ -16,41 +16,32 @@ pub struct IClashTemp(pub Mapping);
 
 impl IClashTemp {
     pub async fn new() -> Self {
-        let clash_path_result = dirs::clash_path();
-        let map_result = if let Ok(path) = clash_path_result {
-            help::read_mapping(&path).await
-        } else {
-            Err(anyhow::anyhow!("Failed to get clash path"))
-        };
-
-        match map_result {
-            Ok(mut map) => {
-                let template_map = Self::template().0;
-                for (key, value) in template_map.into_iter() {
-                    if !map.contains_key(&key) {
-                        map.insert(key, value);
-                    }
-                }
-
-                // 确保 secret 字段存在且不为空
-                if let Some(val) = map.get_mut("secret")
-                    && let Value::String(s) = val
-                    && s.is_empty()
-                {
-                    *s = "set-your-secret".into();
-                }
-
-                Self(Self::guard(map))
-            }
+        match Self::try_new().await {
+            Ok(config) => config,
             Err(err) => {
-                logging!(
-                    error,
-                    Type::Config,
-                    "failed to load clash config, using template: {err:#}"
-                );
+                logging!(error, Type::Config, "读取 clash 配置失败，使用默认模板：{err:#}");
                 Self::template()
             }
         }
+    }
+
+    pub(crate) async fn try_new() -> Result<Self> {
+        let path = dirs::clash_path()?;
+        let mut map = help::read_mapping(&path).await?;
+        let template_map = Self::template().0;
+        for (key, value) in template_map {
+            if !map.contains_key(&key) {
+                map.insert(key, value);
+            }
+        }
+
+        if let Some(Value::String(secret)) = map.get_mut("secret")
+            && secret.is_empty()
+        {
+            *secret = "set-your-secret".into();
+        }
+
+        Ok(Self(Self::guard(map)))
     }
 
     pub fn template() -> Self {
