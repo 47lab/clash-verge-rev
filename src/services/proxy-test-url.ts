@@ -30,8 +30,7 @@ export async function saveProfileTestUrls(
     async () => {
       const profiles = await getProfiles()
       const profile = profiles.items?.find((item) => item.uid === uid)
-      if (!profile || (migrateOnly && profile.latency_test_urls !== undefined))
-        return
+      if (!profile || (migrateOnly && profile.latency_test_urls != null)) return
       await patchProfile(uid, {
         latency_test_urls: {
           ...(profile.latency_test_urls ?? readLegacyTestUrls(uid)),
@@ -53,16 +52,17 @@ const migrating = new Set<string>()
 
 export function migrateProfileTestUrls(profiles: IProfilesConfig) {
   for (const profile of profiles.items || []) {
-    if (profile.latency_test_urls !== undefined || migrating.has(profile.uid))
+    const uid = profile.uid
+    if (!uid || profile.latency_test_urls != null || migrating.has(uid))
       continue
-    const urls = readLegacyTestUrls(profile.uid)
+    const urls = readLegacyTestUrls(uid)
     if (!Object.keys(urls).length) continue
-    migrating.add(profile.uid)
-    void saveProfileTestUrls(profile.uid, urls, true)
+    migrating.add(uid)
+    void saveProfileTestUrls(uid, urls, true)
       .catch((error) => {
         console.error('Failed to migrate latency test URLs:', error)
       })
-      .finally(() => migrating.delete(profile.uid))
+      .finally(() => migrating.delete(uid))
   }
 }
 
@@ -92,10 +92,9 @@ export function profileTestUrls(profile: IProfileItem): Record<string, string> {
   return {
     ...profile.latency_test_urls,
     ...Object.fromEntries(
-      Object.entries(pending.get(profile.uid) ?? {}).map(([group, edit]) => [
-        group,
-        edit.url,
-      ]),
+      Object.entries((profile.uid && pending.get(profile.uid)) || {}).map(
+        ([group, edit]) => [group, edit.url],
+      ),
     ),
   }
 }

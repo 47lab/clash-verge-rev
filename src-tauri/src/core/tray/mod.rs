@@ -548,12 +548,11 @@ fn create_hotkeys(hotkeys: &Option<Vec<String>>) -> HashMap<&str, &str> {
                     let mut parts = item.split(',');
                     match (parts.next(), parts.next()) {
                         (Some(func), Some(key)) => {
-                            // 托盘菜单中的 `accelerator` 属性，在 Linux/Windows 中都不支持小键盘按键的解析
-                            if key.to_uppercase().contains("NUMPAD") {
-                                None
-                            } else {
-                                Some((func, key))
-                            }
+                            // 托盘菜单的 `accelerator` 在 Linux/Windows 下不支持小键盘按键，Windows 下也不支持 Win 键（前端上报为 `CMD`）
+                            let uppercase_key = key.to_uppercase();
+                            let unsupported =
+                                uppercase_key.contains("NUMPAD") || (cfg!(windows) && uppercase_key.contains("CMD"));
+                            if unsupported { None } else { Some((func, key)) }
                         }
                         _ => None,
                     }
@@ -1160,7 +1159,15 @@ fn on_menu_event(_: &AppHandle, event: MenuEvent) {
                     logging!(error, Type::Tray, "Failed to close all connections from tray: {err}");
                 }
             }
-            MenuIds::COPY_ENV => feat::copy_clash_env().await,
+            MenuIds::COPY_ENV => {
+                if let Err(err) = feat::copy_clash_env().await {
+                    logging!(
+                        error,
+                        Type::Tray,
+                        "Failed to copy proxy environment variables from tray: {err:#}"
+                    );
+                }
+            }
             MenuIds::CONF_DIR => {
                 let _ = cmd::open_app_dir().await;
             }

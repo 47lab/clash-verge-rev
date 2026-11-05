@@ -44,6 +44,7 @@ import {
   ProxyGroupNavigator,
 } from './proxy-group-navigator'
 import { ProxyRender } from './proxy-render'
+import type { HeadState } from './use-head-state'
 import {
   PROXY_GROUP_HEADER_SENSORS,
   useProxyGroupHeaderLayout,
@@ -70,6 +71,7 @@ interface Props {
   mode: string
   isChainMode?: boolean
   chainConfigData?: string | null
+  onExitChainMode: () => void
 }
 
 function useEmptyRenderList() {
@@ -90,17 +92,25 @@ function useProxyRenderState(
 ) {
   const { verge } = useVerge()
   const { proxyView } = useProxiesData()
-  const { renderList, onProxies, onHeadState } = useRenderList(
-    mode,
-    isChainMode,
-    activeSelectedGroup,
-  )
+  const {
+    renderList,
+    onProxies,
+    onHeadState: setListHeadState,
+  } = useRenderList(mode, isChainMode, activeSelectedGroup)
   const scrollPositionKey = useMemo(
     () =>
       isChainMode
         ? `${mode}:chain:${activeSelectedGroup ?? 'all'}`
         : `${mode}:normal`,
     [activeSelectedGroup, isChainMode, mode],
+  )
+
+  const onHeadState = useCallback(
+    (groupName: string, patch: Partial<HeadState>) => {
+      if (patch.open) onProxies()
+      setListHeadState(groupName, patch)
+    },
+    [onProxies, setListHeadState],
   )
 
   const timeout = verge?.default_latency_timeout || 10000
@@ -190,8 +200,9 @@ function useProxyRenderState(
 function ChainProxyGroups(props: {
   mode: string
   chainConfigData?: string | null
+  onExitChainMode: () => void
 }) {
-  const { mode, chainConfigData } = props
+  const { mode, chainConfigData, onExitChainMode } = props
   const { proxyView } = useProxiesData()
   const [selectedGroup, setSelectedGroup] = useState<string | null>(null)
 
@@ -346,6 +357,7 @@ function ChainProxyGroups(props: {
       <ProxyGroupsChain
         mode={mode}
         chainConfigData={chainConfigData}
+        onExitChainMode={onExitChainMode}
         availableGroups={availableGroups}
         activeSelectedGroup={activeSelectedGroup}
         showScrollTop={showScrollTop}
@@ -604,7 +616,7 @@ function NormalProxyGroups(props: { mode: string }) {
         />
       </DragDropProvider>
 
-      {mode === 'rule' && (
+      {(mode === 'rule' || mode === 'global') && (
         <ProxyGroupNavigator
           proxyGroupNames={proxyGroupNames}
           onGroupLocation={handleGroupLocationByName}
@@ -617,7 +629,7 @@ function NormalProxyGroups(props: { mode: string }) {
 }
 
 export const ProxyGroups = (props: Props) => {
-  const { mode, isChainMode = false, chainConfigData } = props
+  const { mode, isChainMode = false, chainConfigData, onExitChainMode } = props
   const { profiles, isLoading: isProfilesLoading } = useProfiles()
   const { isProxyViewPending } = useProxiesData()
   const { isRunningModePending } = useSystemData()
@@ -639,7 +651,11 @@ export const ProxyGroups = (props: Props) => {
       return <ProxyEmptyState reason={listState.reason} />
     case 'render':
       return isChainMode ? (
-        <ChainProxyGroups mode={mode} chainConfigData={chainConfigData} />
+        <ChainProxyGroups
+          mode={mode}
+          chainConfigData={chainConfigData}
+          onExitChainMode={onExitChainMode}
+        />
       ) : (
         <NormalProxyGroups mode={mode} />
       )

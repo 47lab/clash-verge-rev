@@ -20,7 +20,6 @@ use crate::{
     utils::{init, server, window_manager::WindowManager},
 };
 use clash_verge_logging::{Type, logging, logging_error};
-use clash_verge_signal;
 
 #[cfg(target_os = "macos")]
 pub mod dns;
@@ -176,6 +175,8 @@ async fn init_silent_updater() {
     );
 }
 
+// Upstream has no session-end signal support on Linux; see crates/clash-verge-signal.
+#[cfg(target_os = "linux")]
 pub(crate) fn init_signal() {
     logging!(debug, Type::Setup, "Initializing signal handlers...");
     clash_verge_signal::register(feat::quit);
