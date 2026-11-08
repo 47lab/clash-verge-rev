@@ -160,6 +160,17 @@ jobs:
         with:
           run_install: false
 
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: '1.22.12'
+          cache: false
+
+      - name: Build patched mihomo core
+        env:
+          MIHOMO_CORE_VERSION: v1.19.33-47lab.${{ github.run_number }}
+        run: node scripts/build-patched-mihomo.mjs aarch64-apple-darwin
+
       - name: Install dependencies and prepare sidecars
         run: |
           pnpm install --frozen-lockfile
@@ -187,6 +198,7 @@ jobs:
       - name: Verify app signature and prepare updater archive
         env:
           CUSTOM_VERSION: ${{ needs.sync.outputs.custom_version }}
+          MIHOMO_CORE_VERSION: v1.19.33-47lab.${{ github.run_number }}
         run: |
           set -euo pipefail
           app_path="$(find target/aarch64-apple-darwin/release/bundle/macos -maxdepth 1 -type d -name '*.app' -print -quit)"
@@ -194,6 +206,17 @@ jobs:
             echo "::error::Tauri build did not produce a macOS app bundle"
             exit 1
           fi
+          core_path="$app_path/Contents/MacOS/verge-mihomo"
+          if [[ ! -x "$core_path" ]]; then
+            echo "::error::Bundled mihomo core is missing at $core_path"
+            exit 1
+          fi
+          core_version="$("$core_path" -v | head -n 1)"
+          if [[ "$core_version" != "Mihomo Meta ${MIHOMO_CORE_VERSION} "* ]]; then
+            echo "::error::Bundled mihomo core is not ${MIHOMO_CORE_VERSION}: ${core_version}"
+            exit 1
+          fi
+          echo "$core_version"
           codesign --verify --deep --strict --verbose=2 "$app_path"
 
           mkdir -p dist

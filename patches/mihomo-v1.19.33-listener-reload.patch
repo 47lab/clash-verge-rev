@@ -1,0 +1,24 @@
+diff --git a/listener/listener.go b/listener/listener.go
+index 3a0a8aa..ba8f2f7 100644
+--- a/listener/listener.go
++++ b/listener/listener.go
+@@ -630,0 +631,9 @@ func PatchInboundListeners(newListenerMap map[string]C.InboundListener, tunnel C
++	if dropOld {
++		for name, oldListener := range inboundListeners {
++			if _, ok := newListenerMap[name]; !ok {
++				_ = oldListener.Close()
++				delete(inboundListeners, name)
++			}
++		}
++	}
++
+@@ -645,9 +653,0 @@ func PatchInboundListeners(newListenerMap map[string]C.InboundListener, tunnel C
+-
+-	if dropOld {
+-		for name, oldListener := range inboundListeners {
+-			if _, ok := newListenerMap[name]; !ok {
+-				_ = oldListener.Close()
+-				delete(inboundListeners, name)
+-			}
+-		}
+-	}
