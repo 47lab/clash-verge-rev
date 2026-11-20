@@ -1,6 +1,6 @@
 use super::resolve;
 use crate::{
-    config::{Config, DEFAULT_PAC, MixedPort},
+    config::{Config, DEFAULT_PAC, IVerge, MixedPort},
     core::lightweight,
     process::AsyncHandler,
     utils::{dirs, window_manager::WindowManager},
@@ -10,21 +10,40 @@ use clash_verge_logging::{Type, logging};
 use parking_lot::Mutex;
 use reqwest::ClientBuilder;
 use serde::{Deserialize, Serialize};
+use std::future::Future;
 use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::sync::oneshot;
 use warp::Filter as _;
 
 const INSTANCE_TOKEN_HEADER: &str = "x-instance-token";
+const PAC_CONFIG_MAX_BODY_BYTES: u64 = 256 * 1024;
 pub(crate) const INSTANCE_RECORD_FILE: &str = "singleton-instance.json";
 pub(crate) const INSTANCE_LOCK_FILE: &str = "singleton-instance.lock";
 
 #[derive(Deserialize, Debug)]
 struct QueryParam {
     param: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct PacConfigPatchRequest {
+    enable_system_proxy: Option<bool>,
+    proxy_auto_config: Option<bool>,
+    pac_file_content: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PacConfigApplyResult {
+    enable_system_proxy: bool,
+    proxy_auto_config: bool,
+    mixed_port: u16,
+    pac_available: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -207,6 +226,93 @@ fn release_dev_quit_latch(quit_requested: &AtomicBool, outcome: clash_verge_sign
     }
 }
 
+fn json_error_reply(status: warp::http::StatusCode, message: &str) -> warp::reply::WithStatus<warp::reply::Json> {
+    warp::reply::with_status(
+        warp::reply::json(&serde_json::json!({
+            "status": "error",
+            "message": message,
+        })),
+        status,
+    )
+}
+
+/// 校验并构造仅包含 PAC / 系统代理白名单字段的 IVerge 补丁，防止误改核心或 TUN 配置。
+fn build_pac_config_patch(body: &[u8]) -> std::result::Result<IVerge, String> {
+    let req: PacConfigPatchRequest =
+        serde_json::from_slice(body).map_err(|error| format!("PAC 配置请求 JSON 无效: {error}"))?;
+    if req.enable_system_proxy.is_none() && req.proxy_auto_config.is_none() && req.pac_file_content.is_none() {
+        return Err("至少需要提供一个 PAC 配置字段".to_string());
+    }
+    if let Some(content) = req.pac_file_content.as_deref()
+        && (content.trim().is_empty() || !content.contains("FindProxyForURL"))
+    {
+        return Err("PAC 脚本必须非空且包含 FindProxyForURL 函数".to_string());
+    }
+    Ok(IVerge {
+        enable_system_proxy: req.enable_system_proxy,
+        proxy_auto_config: req.proxy_auto_config,
+        pac_file_content: req.pac_file_content.map(Into::into),
+        ..IVerge::default()
+    })
+}
+
+/// 受 singleton 令牌保护的 PAC 与系统代理配置热更新路由。
+fn pac_config_route<F, Fut>(
+    token: String,
+    commands_ready: &'static AtomicBool,
+    apply_patch: F,
+) -> impl warp::Filter<Extract = (impl warp::Reply,), Error = warp::Rejection> + Clone
+where
+    F: Fn(Arc<IVerge>) -> Fut + Clone + Send + Sync + 'static,
+    Fut: Future<Output = std::result::Result<PacConfigApplyResult, String>> + Send + 'static,
+{
+    warp::path!("commands" / "pac-config")
+        .and(warp::post())
+        .and(warp::header::optional::<String>(INSTANCE_TOKEN_HEADER))
+        .and(warp::body::content_length_limit(PAC_CONFIG_MAX_BODY_BYTES))
+        .and(warp::body::bytes())
+        .and_then(move |provided: Option<String>, body: bytes::Bytes| {
+            let token = token.clone();
+            let apply_patch = apply_patch.clone();
+            async move {
+                if provided.as_deref() != Some(token.as_str()) {
+                    return Ok::<_, warp::Rejection>(json_error_reply(
+                        warp::http::StatusCode::UNAUTHORIZED,
+                        "singleton 实例令牌无效",
+                    ));
+                }
+                if !commands_ready.load(Ordering::Acquire) {
+                    return Ok(json_error_reply(
+                        warp::http::StatusCode::SERVICE_UNAVAILABLE,
+                        "嵌入式服务正在启动",
+                    ));
+                }
+                let patch = match build_pac_config_patch(&body) {
+                    Ok(patch) => Arc::new(patch),
+                    Err(message) => {
+                        return Ok(json_error_reply(warp::http::StatusCode::BAD_REQUEST, &message));
+                    }
+                };
+                match Box::pin(apply_patch(patch)).await {
+                    Ok(result) => Ok(warp::reply::with_status(
+                        warp::reply::json(&serde_json::json!({
+                            "status": "ok",
+                            "enableSystemProxy": result.enable_system_proxy,
+                            "proxyAutoConfig": result.proxy_auto_config,
+                            "mixedPort": result.mixed_port,
+                            "pacAvailable": result.pac_available,
+                        })),
+                        warp::http::StatusCode::OK,
+                    )),
+                    Err(message) => Ok(json_error_reply(
+                        warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+                        &message,
+                    )),
+                }
+            }
+        })
+}
+
 fn current_mihomo_ipc_path() -> Option<String> {
     let path = match *crate::core::CoreManager::global().get_running_mode() {
         crate::core::manager::RunningMode::Service => dirs::ipc_path().ok(),
@@ -263,7 +369,9 @@ fn start_embedded_server(listener: tokio::net::TcpListener, token: String) {
                         "mihomoIpcPath": mihomo_ipc_path,
                         "capabilities": {
                             "profileReloadNoRestart": true,
-                            "profileReloadProtocol": "47lab-strict-v1"
+                            "profileReloadProtocol": "47lab-strict-v1",
+                            "pacConfigHotUpdate": true,
+                            "pacConfigProtocol": "47lab-pac-v1"
                         }
                     })),
                     warp::http::StatusCode::OK,
@@ -312,6 +420,7 @@ fn start_embedded_server(listener: tokio::net::TcpListener, token: String) {
         Ok::<_, warp::Rejection>(
             warp::http::Response::builder()
                 .header("Content-Type", "application/x-ns-proxy-autoconfig")
+                .header("Cache-Control", "no-store")
                 .body(processed_content)
                 .unwrap_or_default(),
         )
@@ -380,13 +489,29 @@ fn start_embedded_server(listener: tokio::net::TcpListener, token: String) {
         }
     });
 
+    let pac_config = pac_config_route(token, &COMMANDS_READY, |patch| async move {
+        crate::feat::patch_verge(&patch, false)
+            .await
+            .map_err(|error| error.to_string())?;
+        let verge_data = Config::verge().await.data_arc();
+        let mixed_port = MixedPort::desired().await;
+        let pac_available = PAC_AVAILABLE.load(Ordering::Acquire);
+        Ok(PacConfigApplyResult {
+            enable_system_proxy: verge_data.enable_system_proxy.unwrap_or_default(),
+            proxy_auto_config: verge_data.proxy_auto_config.unwrap_or_default(),
+            mixed_port,
+            pac_available,
+        })
+    });
+
     let commands = auth
         .clone()
         .and(visible)
         .or(auth.clone().and(scheme))
         .or(auth.clone().and(reload))
         .or(identity)
-        .or(pac);
+        .or(pac)
+        .or(pac_config);
     #[cfg(feature = "verge-dev")]
     let commands = commands.or(dev_quit_route(token, &COMMANDS_READY, &DEV_QUIT_REQUESTED, || {
         AsyncHandler::spawn(|| async {
@@ -559,4 +684,117 @@ fn write_instance_record(path: &Path, record: &InstanceRecord) -> Result<()> {
     drop(file);
     std::fs::rename(&temporary, path).context("failed to replace singleton record")?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pac_config_patch_validates_whitelist_and_pac_content() -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let valid = br#"{
+            "enableSystemProxy": true,
+            "proxyAutoConfig": true,
+            "pacFileContent": "function FindProxyForURL(url, host) { return \"DIRECT\"; }"
+        }"#;
+        let patch = build_pac_config_patch(valid).map_err(std::io::Error::other)?;
+        assert_eq!(patch.enable_system_proxy, Some(true));
+        assert_eq!(patch.proxy_auto_config, Some(true));
+        assert!(
+            patch
+                .pac_file_content
+                .as_deref()
+                .is_some_and(|s| s.contains("FindProxyForURL"))
+        );
+        assert!(patch.enable_tun_mode.is_none());
+
+        assert!(build_pac_config_patch(br"{}").is_err());
+        assert!(build_pac_config_patch(br#"{"enableTunMode":false}"#).is_err());
+        assert!(build_pac_config_patch(br#"{"pacFileContent":"return 'DIRECT';"}"#).is_err());
+        assert!(build_pac_config_patch(br#"{"pacFileContent":"   "}"#).is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pac_config_route_enforces_auth_readiness_and_payload()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        static TEST_READY: AtomicBool = AtomicBool::new(false);
+        let captured = Arc::new(Mutex::new(None::<Arc<IVerge>>));
+        let captured_ref = Arc::clone(&captured);
+
+        let route = pac_config_route("secret-token".to_string(), &TEST_READY, move |patch| {
+            let captured_ref = Arc::clone(&captured_ref);
+            async move {
+                *captured_ref.lock() = Some(patch);
+                Ok(PacConfigApplyResult {
+                    enable_system_proxy: true,
+                    proxy_auto_config: true,
+                    mixed_port: 2080,
+                    pac_available: true,
+                })
+            }
+        });
+
+        // 缺少或错误令牌应返回 401
+        let unauth = warp::test::request()
+            .method("POST")
+            .path("/commands/pac-config")
+            .body(r#"{"proxyAutoConfig":true}"#)
+            .reply(&route)
+            .await;
+        assert_eq!(unauth.status(), warp::http::StatusCode::UNAUTHORIZED);
+
+        let bad_token = warp::test::request()
+            .method("POST")
+            .path("/commands/pac-config")
+            .header(INSTANCE_TOKEN_HEADER, "wrong-token")
+            .body(r#"{"proxyAutoConfig":true}"#)
+            .reply(&route)
+            .await;
+        assert_eq!(bad_token.status(), warp::http::StatusCode::UNAUTHORIZED);
+
+        // 服务未就绪应返回 503
+        let not_ready = warp::test::request()
+            .method("POST")
+            .path("/commands/pac-config")
+            .header(INSTANCE_TOKEN_HEADER, "secret-token")
+            .body(r#"{"proxyAutoConfig":true}"#)
+            .reply(&route)
+            .await;
+        assert_eq!(not_ready.status(), warp::http::StatusCode::SERVICE_UNAVAILABLE);
+
+        // 就绪后非法负载应返回 400
+        TEST_READY.store(true, Ordering::Release);
+        let bad_payload = warp::test::request()
+            .method("POST")
+            .path("/commands/pac-config")
+            .header(INSTANCE_TOKEN_HEADER, "secret-token")
+            .body(r#"{"enableTunMode":false}"#)
+            .reply(&route)
+            .await;
+        assert_eq!(bad_payload.status(), warp::http::StatusCode::BAD_REQUEST);
+
+        // 合法请求应返回 200 并仅传递白名单字段
+        let ok_resp = warp::test::request()
+            .method("POST")
+            .path("/commands/pac-config")
+            .header(INSTANCE_TOKEN_HEADER, "secret-token")
+            .body(r#"{"enableSystemProxy":true,"proxyAutoConfig":true,"pacFileContent":"function FindProxyForURL(url, host) { return \"DIRECT\"; }"}"#)
+            .reply(&route)
+            .await;
+        assert_eq!(ok_resp.status(), warp::http::StatusCode::OK);
+        let json: serde_json::Value = serde_json::from_slice(ok_resp.body())?;
+        assert_eq!(json["status"], "ok");
+        assert_eq!(json["enableSystemProxy"], true);
+        assert_eq!(json["proxyAutoConfig"], true);
+        assert_eq!(json["mixedPort"], 2080);
+        assert_eq!(json["pacAvailable"], true);
+
+        let saved = captured.lock().take().ok_or("未捕获到 patch")?;
+        assert_eq!(saved.enable_system_proxy, Some(true));
+        assert_eq!(saved.proxy_auto_config, Some(true));
+        assert!(saved.pac_file_content.is_some());
+        assert!(saved.enable_tun_mode.is_none());
+        Ok(())
+    }
 }
